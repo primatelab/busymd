@@ -100,6 +100,163 @@ format_text() {
     echo "$t"
 }
 
+# Visible character count, ignoring ANSI color sequences
+visible_len() {
+    local s="$1"
+    local re=$'\033[[][0-9;]*[a-zA-Z]'
+    while [[ $s =~ $re ]]; do
+        s="${s//"${BASH_REMATCH[0]}"}"
+    done
+    echo "${#s}"
+}
+
+# Trim leading and trailing whitespace from a table cell
+trim_cell() {
+    local s="$1"
+    if [[ $s =~ ^[[:space:]]+(.*)$ ]]; then
+        s="${BASH_REMATCH[1]}"
+    fi
+    if [[ $s =~ ^(.*[^[:space:]])[[:space:]]+$ ]]; then
+        s="${BASH_REMATCH[1]}"
+    fi
+    printf '%s' "$s"
+}
+
+# Pad text to a visible width. align is left, right, or center.
+pad_cell() {
+    local text="$1" width="$2" align="${3:-left}"
+    local len left_pad right_pad
+    len=$(visible_len "$text")
+    if (( len >= width )); then
+        printf '%s' "$text"
+        return 0
+    fi
+    case "$align" in
+        right)
+            printf '%s%s' "$(repeat_char ' ' $((width - len)))" "$text"
+            ;;
+        center)
+            left_pad=$(( (width - len) / 2 ))
+            right_pad=$(( width - len - left_pad ))
+            printf '%s%s%s' "$(repeat_char ' ' "$left_pad")" "$text" "$(repeat_char ' ' "$right_pad")"
+            ;;
+        *)
+            printf '%s%s' "$text" "$(repeat_char ' ' $((width - len)))"
+            ;;
+    esac
+}
+
+# Field idx from a unit-separator-terminated packed row.
+# `row` is assigned on its own so it does not see the caller's packed array.
+nth_field() {
+    local row="$1" idx="$2"
+    local rest="$row" n=0 cell fs=$'\x1F'
+    while [[ $rest == *"$fs"* ]]; do
+        cell="${rest%%"$fs"*}"
+        rest="${rest#*"$fs"}"
+        if (( n == idx )); then
+            printf '%s' "$cell"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+}
+
+table_rule() {
+    local left="$1" join="$2" right="$3"
+    shift 3
+    local -a widths=("$@")
+    local out="${C}${left}" c
+    for ((c=0; c<${#widths[@]}; c++)); do
+        if (( c > 0 )); then
+            out+="${join}"
+        fi
+        out+="$(repeat_char '─' $(( widths[c] + 2 )))"
+    done
+    echo "${out}${right}${R}"
+}
+
+# Draw a collected markdown table as a padded box
+render_box_table() {
+    local -a lines=("$@")
+    local n=${#lines[@]}
+    if (( n == 0 )); then
+        return 0
+    fi
+
+    local -a packed=() seps=()
+    local max_cols=0
+    local fs=$'\x1F'
+    local i j line rest cell count vlen
+
+    for ((i=0; i<n; i++)); do
+        line="${lines[i]}"
+        if [[ $line =~ ^\|[[:space:]:\|\-]+\|$ ]]; then
+            seps[i]=1
+        else
+            seps[i]=0
+        fi
+        line="${line#|}"
+        line="${line%|}"
+        rest="$line"
+        packed[i]=""
+        count=0
+        while [[ $rest =~ ^([^|]*)\|(.*)$ ]]; do
+            cell="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            packed[i]+="$(trim_cell "$cell")${fs}"
+            count=$((count + 1))
+        done
+        packed[i]+="$(trim_cell "$rest")${fs}"
+        count=$((count + 1))
+        if (( count > max_cols )); then
+            max_cols=$count
+        fi
+    done
+
+    local -a disp=() widths=() aligns=()
+    for ((j=0; j<max_cols; j++)); do
+        widths[j]=0
+        aligns[j]=left
+    done
+
+    for ((i=0; i<n; i++)); do
+        for ((j=0; j<max_cols; j++)); do
+            cell=$(nth_field "${packed[i]}" "$j")
+            if (( seps[i] )); then
+                if [[ $cell =~ ^:-+:$ ]]; then
+                    aligns[j]=center
+                elif [[ $cell =~ ^-+:$ ]]; then
+                    aligns[j]=right
+                fi
+            else
+                cell=$(inline "$cell")
+                disp[i*max_cols+j]="$cell"
+                vlen=$(visible_len "$cell")
+                if (( vlen > widths[j] )); then
+                    widths[j]=$vlen
+                fi
+            fi
+        done
+    done
+
+    local out
+    table_rule "┌" "┬" "┐" "${widths[@]}"
+    for ((i=0; i<n; i++)); do
+        if (( seps[i] )); then
+            table_rule "├" "┼" "┤" "${widths[@]}"
+            continue
+        fi
+        out="${C}│${R}"
+        for ((j=0; j<max_cols; j++)); do
+            cell=$(pad_cell "${disp[i*max_cols+j]:-}" "${widths[j]}" "${aligns[j]}")
+            out+=" ${cell} ${C}│${R}"
+        done
+        echo "$out"
+    done
+    table_rule "└" "┴" "┘" "${widths[@]}"
+}
+
 inline() {
     local t="$1" m link_text placeholder
     local -a replacements=()
@@ -112,7 +269,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${B}${M}${U}${BASH_REMATCH[2]}${R} ${G}→${R} ${G}${BASH_REMATCH[1]}${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # HTML links: <a href="url">text</a>
@@ -121,7 +278,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${B}${M}${U}${BASH_REMATCH[2]}${R} ${G}→${R} ${G}${BASH_REMATCH[1]}${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # HTML bold tags: <b>text</b>
@@ -130,7 +287,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${B}${RED}${BASH_REMATCH[1]}${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # Footnote references: [^1] - MUST be before other bracket patterns!
@@ -139,7 +296,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${M}[${BASH_REMATCH[1]}]${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # Linked images: [![alt](img-url)](link-url) - MUST be first!
@@ -150,7 +307,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${M}${U}🖼  ${BASH_REMATCH[1]}${R} ${BL}→${R} ${BL}${BASH_REMATCH[3]}${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # Images: ![alt](url)
@@ -160,7 +317,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${M}🖼  ${BASH_REMATCH[1]}${R} ${D}${C}[${BASH_REMATCH[2]}]${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # Links: [text](url) - Format the link text first!
@@ -171,7 +328,7 @@ inline() {
         placeholder="${PH}${placeholder_idx}${PH}"
         replacements[$placeholder_idx]="${B}${M}${U}${link_text}${R} ${G}→${R} ${G}${BASH_REMATCH[2]}${R}"
         t="${t/"$m"/$placeholder}"
-        ((placeholder_idx++))
+        placeholder_idx=$((placeholder_idx + 1))
     done
     
     # Format remaining text (not in links/images)
@@ -186,11 +343,19 @@ inline() {
 }
 
 render() {
-    local input="$1" line prev_empty=1
+    local input="$1" line prev_empty=1 pending="" pending_set=0
+    local -a table_lines=()
     
     [[ -f "$input" ]] || input="/dev/stdin"
     
-    while IFS= read -r line; do
+    while true; do
+        if ((pending_set)); then
+            line="$pending"
+            pending_set=0
+            pending=""
+        elif ! IFS= read -r line; then
+            break
+        fi
         # Code blocks: ```lang (with optional leading whitespace)
         if [[ $line =~ ^[[:space:]]*\`\`\`(.*)$ ]]; then
             if ((in_code == 0)); then
@@ -209,7 +374,7 @@ render() {
         fi
         
         if ((in_code == 1)); then
-            ((code_num++))
+            code_num=$((code_num + 1))
             local num=$(printf "%3d" $code_num)
             if [[ $line =~ ^[[:space:]]*# ]] || [[ $line =~ ^[[:space:]]*// ]]; then
                 echo "${D}${C}${num}${R} ${D}${C}│${R} ${GR}${line}${R}"
@@ -349,22 +514,19 @@ render() {
             continue
         fi
         
-        # Tables: | col | col |
+        # Tables: | col | col |  (buffered so columns can be padded)
         if [[ $line =~ ^\|.*\|$ ]]; then
-            if [[ $line =~ ^\|[[:space:]:\|\-]+\|$ ]]; then
-                echo "${C}$(repeat_char ─ $WIDTH)${R}"
-            else
-                line="${line#|}" line="${line%|}"
-                local output="${C}│${R}" rest="$line" cell
-                while [[ $rest =~ ^([^|]*)\|(.*)$ ]]; do
-                    cell="${BASH_REMATCH[1]}"
-                    rest="${BASH_REMATCH[2]}"
-                    output+=" $(inline "$cell") ${C}│${R}"
-                done
-                # Handle last cell (no trailing |)
-                [[ -n $rest ]] && output+=" $(inline "$rest") ${C}│${R}"
-                echo "$output"
-            fi
+            table_lines=("$line")
+            while IFS= read -r line; do
+                if [[ $line =~ ^\|.*\|$ ]]; then
+                    table_lines+=("$line")
+                else
+                    pending="$line"
+                    pending_set=1
+                    break
+                fi
+            done
+            render_box_table "${table_lines[@]}"
             continue
         fi
         
